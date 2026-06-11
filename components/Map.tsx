@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useRef } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -8,9 +8,9 @@ import {
   CircleMarker,
   Tooltip,
   Popup,
+  Polyline,
 } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
-import { Bar, Doughnut } from "react-chartjs-2";
 import {
   Chart as ChartJS,
   CategoryScale,
@@ -21,11 +21,11 @@ import {
   ArcElement,
 } from "chart.js";
 import {
-  FaExclamationTriangle,
   FaFilter,
   FaCalendarAlt,
   FaBrain,
   FaSync,
+  FaVolumeUp,
   FaNewspaper,
   FaCheckCircle,
 } from "react-icons/fa";
@@ -56,23 +56,23 @@ const getColorByProbability = (prob: number): string => {
 const getFillOpacity = (prob: number) => Math.min(0.94, 0.48 + prob / 105);
 
 export default function Map() {
+  const mapContainerRef = useRef<HTMLDivElement>(null);
   const [hotspots, setHotspots] = useState<Hotspot[]>([]);
   const [predictedTotal, setPredictedTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [hovered, setHovered] = useState<string | null>(null);
   const [geoJson, setGeoJson] = useState<any>(null);
+  const [simulationPaths, setSimulationPaths] = useState<number[][][]>([]);
+
+  // Monte Carlo Dot Loop State
+  const [simStep, setSimStep] = useState<number>(0);
 
   // Parameter Tuning
   const [selectedQuarter, setSelectedQuarter] = useState<string>("");
-  const [selectedAttackType, setSelectedAttackType] = useState<string>("All");   // ← NEW
+  const [selectedAttackType, setSelectedAttackType] = useState<string>("All");
   const [minProb, setMinProb] = useState<number>(5);
   const [topN, setTopN] = useState<number>(15);
-
-  // News Ingester
-  const [newsUrl, setNewsUrl] = useState("");
-  const [ingestLoading, setIngestLoading] = useState(false);
-  const [toast, setToast] = useState<{ message: string; type: "success" | "error" } | null>(null);
 
   const futureQuarters = useMemo(() => {
     const opts: string[] = [""];
@@ -83,15 +83,6 @@ export default function Map() {
     }
     return opts;
   }, []);
-
-  // Attack Type options (matching your GTD mapping)
-  const attackTypes = [
-    "All",
-    "Kidnapping",
-    "Armed Assault",
-    "Bombing/Explosion",
-    "Assassination",
-  ];
 
   useEffect(() => {
     fetch("/full.json")
@@ -126,30 +117,37 @@ export default function Map() {
     loadData();
   }, [selectedQuarter, selectedAttackType, minProb, topN]);
 
-  const handleIngest = async () => {
-    if (!newsUrl) return;
-    setIngestLoading(true);
-    try {
-      const res = await fetch("http://127.0.0.1:8001/ingest-from-url", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ url: newsUrl }),
-      });
-      const result = await res.json();
-      if (result.status === "success") {
-        setToast({ message: `✅ Added: ${result.attack_type}`, type: "success" });
-        window.location.reload();
-      }
-    } catch {
-      setToast({ message: "Failed to add news", type: "error" });
-    } finally {
-      setIngestLoading(false);
-      setNewsUrl("");
-      setTimeout(() => setToast(null), 4000);
+  // ANIMATION CONTROL LOOP: Increments steps to render running bad actor dots across line nodes
+  useEffect(() => {
+    if (simulationPaths.length === 0) {
+      setSimStep(0);
+      return;
     }
+    const timer = setInterval(() => {
+      setSimStep((prev) => {
+        const totalPoints = simulationPaths[0]?.length || 1;
+        if (prev >= totalPoints - 1) return 0; // Loop tracking cycle
+        return prev + 1;
+      });
+    }, 900);
+    return () => clearInterval(timer);
+  }, [simulationPaths]);
+
+  // Read Aloud Feature
+  const handleReadAloud = () => {
+    if (!("speechSynthesis" in window)) {
+      alert("Text-to-speech is not supported in this browser.");
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const topStates = hotspots.slice(0, 3).map(h => h.state).join(", ");
+    const text = `Threat simulation active. The AI predicts ${predictedTotal || 0} total attacks. Top critical hotspots identified are ${topStates}. Please review the Monte Carlo spread and charts on the dashboard for tactical mitigation.`;
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 0.95;
+    utterance.pitch = 1.0;
+    window.speechSynthesis.speak(utterance);
   };
 
-  // Charts (kept exactly as before)
   const casualtiesChart = useMemo(() => ({
     labels: hotspots.map((h) => h.state),
     datasets: [{
@@ -195,7 +193,7 @@ export default function Map() {
   }
 
   return (
-    <div className="fixed inset-0 bg-black text-white overflow-hidden">
+    <div ref={mapContainerRef} className="fixed inset-0 bg-black text-white overflow-hidden">
       <MapContainer center={[9.082, 8.6753]} zoom={6} style={{ width: "100%", height: "100%" }}>
         <TileLayer url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" attribution="© OpenStreetMap" />
 
@@ -216,6 +214,7 @@ export default function Map() {
           />
         )}
 
+        {/* Render Hotspots */}
         {hotspots.map((spot) => (
           <CircleMarker
             key={spot.state}
@@ -230,54 +229,70 @@ export default function Map() {
           >
             <Tooltip>{spot.state} • {spot.probability}%</Tooltip>
             <Popup className="z-[100]">
-              <div className="p-2">
+              <div className="p-2 text-black">
                 <h3 className="text-xl font-bold">{spot.state}</h3>
                 <p>Threat: <b>{spot.probability}%</b></p>
-                <p>Type: {spot.attack_type}</p>
+                <p>Code: {spot.attack_type}</p>
                 <p>Weapon: {spot.weapon}</p>
                 <p>Casualties: {spot.expected_casualties}</p>
               </div>
             </Popup>
           </CircleMarker>
         ))}
+
+        {/* Render Monte Carlo Simulation Paths and Active Bad Actor Dots */}
+        {simulationPaths.map((path, idx) => {
+          const currentActorPoint = path[simStep] || path[path.length - 1];
+          return (
+            <div key={`sim-group-${idx}`}>
+              {/* Underlying Track Guideline */}
+              <Polyline 
+                positions={path as any} 
+                pathOptions={{ color: "rgba(255, 45, 85, 0.5)", weight: 1.5, dashArray: "5, 5" }} 
+              />
+              {/* Moving Bad Actor Dot */}
+              {currentActorPoint && (
+                <CircleMarker 
+                  center={[currentActorPoint[0], currentActorPoint[1]]}
+                  radius={5}
+                  pathOptions={{
+                    color: "#ff2d55",
+                    fillColor: "#ffffff",
+                    fillOpacity: 1,
+                    weight: 2,
+                  }}
+                >
+                  <Tooltip>Actor Token {idx + 1}</Tooltip>
+                </CircleMarker>
+              )}
+            </div>
+          );
+        })}
       </MapContainer>
 
-      {/* News Ingester */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 bg-gray-950/90 backdrop-blur-xl border border-green-500/50 p-4 rounded-2xl shadow-2xl z-[1000] flex gap-3 w-[420px]">
-        <input
-          type="text"
-          value={newsUrl}
-          onChange={(e) => setNewsUrl(e.target.value)}
-          placeholder="Paste news URL here..."
-          className="flex-1 bg-black border border-green-600 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-green-400"
-        />
-        <button
-          onClick={handleIngest}
-          disabled={ingestLoading}
-          className="bg-green-600 hover:bg-green-500 px-6 rounded-xl font-medium flex items-center gap-2 disabled:opacity-50"
+      {/* Global Status Banner Bar */}
+      <div className="absolute top-6 left-1/2 -translate-x-1/2 flex items-center gap-4 z-[1000]">
+        <div className="bg-black/75 backdrop-blur-2xl px-10 py-4 rounded-full border border-green-500/40 shadow-[0_0_40px_rgba(57,255,20,0.22)] text-lg font-medium">
+          {hovered ? hovered : "Hover or click states for details"}
+        </div>
+        <button 
+          onClick={handleReadAloud}
+          className="bg-black/80 backdrop-blur-md p-4 rounded-full border border-green-500/50 hover:bg-green-900/50 transition shadow-[0_0_20px_rgba(57,255,20,0.2)] text-green-400"
+          title="Read Dashboard Aloud"
         >
-          {ingestLoading ? "Adding..." : <><FaNewspaper /> Add News</>}
+          <FaVolumeUp size={20} />
         </button>
       </div>
 
-      {/* Toast */}
-      {toast && (
-        <div className={`absolute bottom-24 left-1/2 -translate-x-1/2 px-8 py-4 rounded-2xl flex items-center gap-3 shadow-2xl z-[2000] ${toast.type === "success" ? "bg-green-600" : "bg-red-600"}`}>
-          <FaCheckCircle className="text-2xl" />
-          {toast.message}
-        </div>
-      )}
-
-      {/* Left Panel - Controls (Quarter + NEW Attack Type Dropdown) */}
+      {/* Left Panel - Control Matrix */}
       <div className="absolute top-5 left-5 z-[1000] w-80 space-y-5">
         <div className="bg-gray-950/65 backdrop-blur-2xl border border-green-500/35 p-6 rounded-3xl">
           <h2 className="text-lg font-bold mb-5 flex items-center gap-3" style={{ color: NEON_GREEN }}>
-            <FaFilter size={18} /> Controls
+            <FaFilter size={18} /> Threat Parameters
           </h2>
           <div className="space-y-6">
-            {/* Quarter Selector */}
             <div>
-              <label className=" text-sm mb-2 flex items-center gap-2">
+              <label className="text-sm mb-2 flex items-center gap-2 text-gray-50">
                 <FaCalendarAlt size={15} /> Forecast Quarter
               </label>
               <select
@@ -292,10 +307,9 @@ export default function Map() {
               </select>
             </div>
 
-            {/* NEW: Predict by Attack Type Dropdown */}
             <div>
-              <label className=" text-sm mb-2 flex items-center gap-2">
-                Predict by Attack Type
+              <label className="text-sm mb-2 flex items-center gap-2 text-gray-50">
+                Filter by Attack Code/Type
               </label>
               <select
                 value={selectedAttackType}
@@ -309,7 +323,7 @@ export default function Map() {
             </div>
 
             <div>
-              <label className="block text-sm mb-2">Minimum Probability {minProb}%</label>
+              <label className="block text-sm mb-2 text-gray-50">Minimum Probability {minProb}%</label>
               <input
                 type="range"
                 min={0}
@@ -319,11 +333,10 @@ export default function Map() {
                 onChange={(e) => setMinProb(Number(e.target.value))}
                 className="w-full accent-green-500"
               />
-              
             </div>
 
             <div>
-              <label className="block text-sm mb-2">Display Top N : Top {topN}</label>
+              <label className="block text-sm mb-2 text-gray-50">Display Top N : Top {topN}</label>
               <input
                 type="range"
                 min={5}
@@ -332,7 +345,6 @@ export default function Map() {
                 onChange={(e) => setTopN(Number(e.target.value))}
                 className="w-full accent-green-500"
               />
-              
             </div>
 
             <button
@@ -341,58 +353,60 @@ export default function Map() {
                 setSelectedAttackType("All");
                 setMinProb(5);
                 setTopN(15);
+                setSimulationPaths([]);
               }}
               className="w-full py-3 bg-black border-2 border-green-600/60 rounded-xl font-medium hover:bg-green-950/40 transition flex items-center justify-center gap-2 text-base"
               style={{ color: NEON_GREEN }}
             >
-              <FaSync size={15} /> Reset
+              <FaSync size={15} /> Reset Topology
             </button>
           </div>
         </div>
 
         <div className="bg-gray-950/65 backdrop-blur-2xl border border-green-500/35 p-5 rounded-3xl text-center">
-          <p className="text-sm opacity-80 mb-1">Predicted Attacks</p>
+          <p className="text-sm text-gray-50 mb-1">Predicted Attacks</p>
           <p className="text-4xl font-black tracking-tight" style={{ color: NEON_GREEN }}>
             {predictedTotal ?? "—"}
           </p>
         </div>
       </div>
 
-      {/* Right Panel - AI Insights + Charts (unchanged) */}
-      <div className="absolute top-5 right-5 z-[1000] w-96 space-y-5">
-        {/* Your existing AI Observations + Charts stay exactly here */}
-        {/* (I kept them identical to your previous version) */}
+      {/* Right Panel - Master Component Switcher */}
+      <div className="absolute top-5 right-5 z-[1000] w-[400px] space-y-5">
+        {/* REARRANGEMENT TRADEOFF: Risk Matrix has taken precedence at the top */}
         <div className="bg-gray-950/65 backdrop-blur-2xl border border-green-500/35 p-6 rounded-3xl">
-          <h2 className="text-xl font-bold mb-5 flex items-center gap-3" style={{ color: NEON_GREEN }}>
-            <FaBrain size={18} /> AI Observations
-          </h2>
-          <div className="space-y-4 h-44 overflow-y-scroll text-sm">
-            {insights.map((text, i) => (
-              <div key={i} className="bg-black/45 p-4 rounded-2xl border border-green-600/25">
-                {text}
-              </div>
-            ))}
+          <h4 className="font-bold mb-3 flex items-center gap-2 text-green-400 text-sm">Risk Classification Matrix</h4>
+          <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-xs text-gray-50">
+            <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ff2d55]"></div> Critical (≥ 80%)</div>
+            <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ff9500]"></div> High (60–79%)</div>
+            <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ffcc00]"></div> Elevated (40–59%)</div>
+            <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#39FF14]"></div> Monitored (≤ 39%)</div>
           </div>
         </div>
 
-        <ChartSwitcher casualtiesChart={casualtiesChart} typeDistribution={typeDistribution} NEON_GREEN={NEON_GREEN}/>
+        <ChartSwitcher 
+          casualtiesChart={casualtiesChart} 
+          typeDistribution={typeDistribution} 
+          NEON_GREEN={NEON_GREEN}
+          hotspots={hotspots}
+          setSimulationPaths={setSimulationPaths}
+          mapRef={mapContainerRef}
+        />
       </div>
 
-      {/* Legend - Top Right */}
-      <div className="absolute bottom-6 left-[25vw] bg-black/80 backdrop-blur-2xl p-5 rounded-3xl border border-green-500/40 shadow-2xl z-[1000] text-xs">
-        <h4 className="font-bold mb-3 flex items-center gap-2 text-green-400">Risk Levels</h4>
-        <div className="grid grid-cols-1 gap-x-6 gap-y-2 text-xs">
-          <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ff2d55]"></div> ≥ 80%</div>
-          <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ff9500]"></div> 60–79%</div>
-          <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#ffcc00]"></div> 40–59%</div>
-          <div className="flex items-center gap-3"><div className="w-4 h-4 rounded-full bg-[#39FF14]"></div> ≤ 39%</div>
+      {/* Down-Migrated Tactical Observations - Now anchored safely in Bottom-Left layout */}
+      {/* <div className="absolute bottom-6 left-5 bg-black/80 backdrop-blur-2xl p-5 rounded-3xl border border-green-500/40 shadow-2xl z-[1000] w-80">
+        <h2 className="text-sm font-bold mb-3 flex items-center gap-3" style={{ color: NEON_GREEN }}>
+          <FaBrain size={15} /> Tactical Observations
+        </h2>
+        <div className="space-y-2 max-h-32 overflow-y-scroll text-[11px]">
+          {insights.map((text, i) => (
+            <div key={i} className="bg-black/45 p-2 rounded-xl border border-green-600/25 text-gray-200">
+              {text}
+            </div>
+          ))}
         </div>
-      </div>
-
-      {/* Bottom Status Bar */}
-      <div className="absolute top-6 left-1/2 -translate-x-1/2 bg-black/75 backdrop-blur-2xl px-10 py-4 rounded-full border border-green-500/40 shadow-[0_0_40px_rgba(57,255,20,0.22)] text-lg font-medium z-[1000]">
-        {hovered ? hovered : "Hover or click states for details"}
-      </div>
+      </div> */}
     </div>
   );
 }
